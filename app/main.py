@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -9,12 +10,14 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import report, schemaio, settings, store
+from .rollout import advance
 from .schemaio import SchemaError
 from .types import DECIMAL_RULES, matrix_table
 
 app = FastAPI(title=settings.APP_NAME)
 app.mount("/static", StaticFiles(directory=str(settings.BASE_DIR / "app" / "static")), name="static")
 templates = Jinja2Templates(directory=str(settings.BASE_DIR / "app" / "templates"))
+_ROLLOUT_LOCK = threading.Lock()
 
 
 def _ctx(request: Request, active: str, **extra) -> dict:
@@ -36,17 +39,19 @@ def _index_stats(sample_count: int, history: list[dict]) -> dict:
     }
 
 
-def _resolve_inputs(payload: dict) -> tuple[dict, dict, dict, str]:
+def _resolve_inputs(payload: dict) -> tuple[dict, dict, dict, list[dict], str]:
     if not isinstance(payload, dict):
         raise SchemaError("请求体必须是 JSON 对象")
     sample_key = str(payload.get("sample") or "").strip().upper()
     if sample_key in settings.SAMPLE_KEYS:
         sample = schemaio.load_sample(sample_key)
-        return sample["old"], sample["new"], sample["consumers"], f"样例 {sample_key}"
+        return (sample["old"], sample["new"], sample["consumers"],
+                sample["tasks"], f"样例 {sample_key}")
     old = schemaio.parse_schema(payload.get("old"), "旧 schema")
     new = schemaio.parse_schema(payload.get("new"), "新 schema")
     consumers = schemaio.parse_consumers(payload.get("consumers"), "数据文件清单")
-    return old, new, consumers, "自定义输入"
+    tasks = schemaio.parse_tasks(payload.get("tasks"), "任务清单")
+    return old, new, consumers, tasks, "自定义输入"
 
 
 @app.get("/health")
@@ -77,7 +82,8 @@ async def workbench(request: Request):
         key = "A"
     sample = schemaio.load_sample(key)
     # 右侧面板「预演」：复用既有纯函数算一遍所选样例，不落库、不改接口。
-    preview = report.build_run(sample["old"], sample["new"], sample["consumers"], f"样例 {key}")
+    preview = report.build_run(sample["old"], sample["new"], sample["consumers"],
+                               f"样例 {key}", sample["tasks"])
     return templates.TemplateResponse(
         request, "workbench.html",
         _ctx(
@@ -90,6 +96,7 @@ async def workbench(request: Request):
             old_text=sample["raw_old"],
             new_text=sample["raw_new"],
             consumers_text=sample["raw_consumers"],
+            tasks_text=sample["raw_tasks"],
         ),
     )
 
@@ -101,18 +108,19 @@ async def api_compare(request: Request):
     except Exception:
         return JSONResponse({"detail": "请求体必须是 JSON，且 Content-Type 为 application/json"}, status_code=400)
     try:
-        old, new, consumers, source = _resolve_inputs(payload)
+        old, new, consumers, tasks, source = _resolve_inputs(payload)
         if old["table"] != new["table"]:
             raise SchemaError(f"新旧 schema 的表名不一致：{old['table']} vs {new['table']}")
         if consumers.get("table") and consumers["table"] != new["table"]:
             raise SchemaError(f"数据文件清单的表名 {consumers['table']} 与新 schema {new['table']} 不一致")
-        run = report.build_run(old, new, consumers, source)
+        run = report.build_run(old, new, consumers, source, tasks)
         run = store.save_run(run)
     except SchemaError as exc:
         return JSONResponse({"detail": str(exc)}, status_code=400)
     return {
         "run_id": run["run_id"],
         "summary": run["summary"],
+        "rollout": run["rollout"],
         "redirect": f"/result/{run['run_id']}",
     }
 
@@ -131,6 +139,7 @@ async def api_sample(key: str):
         "old": sample["raw_old"],
         "new": sample["raw_new"],
         "consumers": sample["raw_consumers"],
+        "tasks": sample["raw_tasks"],
     }
 
 
@@ -151,7 +160,39 @@ async def api_run(run_id: str):
         run = store.load_run(run_id)
     except KeyError:
         return JSONResponse({"detail": f"运行记录 {run_id} 不存在"}, status_code=404)
-    return run
+    return report.readiness(run)
+
+
+@app.post("/api/runs/{run_id}/rollout")
+async def api_rollout_advance(request: Request, run_id: str):
+    """推进或重试一个切换阶段；失败保留原状态，重复提交已完成阶段不会重复推进。"""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        return JSONResponse({"detail": "请求体必须是 JSON 对象"}, status_code=400)
+    stage_id = payload.get("stage")
+    if stage_id is not None and (isinstance(stage_id, bool) or not isinstance(stage_id, int)):
+        return JSONResponse({"detail": "stage 必须是整数"}, status_code=400)
+    with _ROLLOUT_LOCK:
+        try:
+            run = report.readiness(store.load_run(run_id))
+        except KeyError:
+            return JSONResponse({"detail": f"运行记录 {run_id} 不存在"}, status_code=404)
+            return JSONResponse({"detail": f"运行记录 {run_id} 不存在"}, status_code=404)
+        rollout = run.get("rollout") or {}
+        if not rollout.get("available"):
+            return JSONResponse({"detail": "该运行没有任务清单，无法执行切换阶段"}, status_code=409)
+        execution, result = advance(rollout, rollout.get("execution") or {}, stage_id)
+        run["rollout"] = rollout
+        run["rollout"]["execution"] = execution
+        run["summary"].update(report.execution_summary(run["rollout"]))
+        store.save_run(run)
+    result = dict(result)
+    result["execution"] = execution
+    result["summary"] = run["summary"]
+    return JSONResponse(result, status_code=200 if result["ok"] else 409)
 
 
 @app.get("/api/runs/{run_id}/migration.sql", response_class=PlainTextResponse)
@@ -160,8 +201,9 @@ async def api_sql(run_id: str):
         run = store.load_run(run_id)
     except KeyError:
         return PlainTextResponse(f"-- 运行记录 {run_id} 不存在\n", status_code=404)
+    body = run["migration"]["sql_text"] + "\n" + report.rollout_text(report.readiness(run))
     return PlainTextResponse(
-        run["migration"]["sql_text"],
+        body,
         media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{report.sql_download_name(run)}"'},
     )
@@ -170,7 +212,7 @@ async def api_sql(run_id: str):
 @app.get("/result/{run_id}", response_class=HTMLResponse)
 async def result_page(request: Request, run_id: str):
     try:
-        run = store.load_run(run_id)
+        run = report.readiness(store.load_run(run_id))
     except KeyError:
         return templates.TemplateResponse(
             request, "not_found.html",
@@ -192,7 +234,7 @@ async def result_page(request: Request, run_id: str):
 @app.get("/review", response_class=HTMLResponse)
 async def review_page(request: Request):
     runs = store.list_runs(limit=50)
-    latest = store.load_run(runs[0]["run_id"]) if runs else None
+    latest = report.readiness(store.load_run(runs[0]["run_id"])) if runs else None
     return templates.TemplateResponse(
         request, "review.html",
         _ctx(

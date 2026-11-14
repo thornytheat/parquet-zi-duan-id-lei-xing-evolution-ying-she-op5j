@@ -47,6 +47,11 @@
         <label for="consumers">数据文件清单（consumers.json）</label>
         <textarea id="consumers" spellcheck="false">{{ consumers_text }}</textarea>
       </div>
+      <div class="field">
+        <label for="tasks">任务清单（tasks.json，滚动切换窗口）</label>
+        <textarea id="tasks" spellcheck="false">{{ tasks_text }}</textarea>
+        <p class="hint">每项：name、role（writer/reader）、version（old/new）、switch_at；可选 start_at / stop_at。按切换时刻切阶段，核对窗口内仍在运行的写入与读取版本。</p>
+      </div>
 
       <div id="error-box" class="alert alert-error" role="alert" hidden></div>
       <div id="ok-box" class="alert alert-info" hidden></div>
@@ -291,6 +296,51 @@
         <ol class="list small" style="margin:0">
           {% for item in preview.migration.upgrade_order %}<li>{{ item }}</li>{% endfor %}
         </ol>
+      </div>
+
+      <div class="panel-head" style="border-top:1px solid var(--line)">
+        <h3>滚动切换窗口（{{ preview.rollout.total_stages }} 个阶段）</h3>
+        <div class="panel-actions">
+          <span class="tag {% if preview.rollout.status == 'ready' %}ok{% elif preview.rollout.status in ('blocked', 'needs_confirm') %}err{% endif %}">{{ preview.rollout.status_label }}</span>
+        </div>
+      </div>
+      {% if preview.rollout.available %}
+      <div class="panel-body tight">
+        <p class="small" style="margin:0 0 6px">{{ preview.rollout.window_text }}</p>
+        <p class="small muted" style="margin:0">预演为只读：执行与重试在结果页按 run 记录推进。</p>
+      </div>
+      <div class="table-wrap" style="max-height:280px">
+        <table class="dense">
+          <thead><tr><th style="width:56px">阶段</th><th style="width:170px">窗口</th><th style="width:170px">写入 × 读取</th><th style="width:100px">结论</th><th>说明</th></tr></thead>
+          <tbody>
+            {% for stage in preview.rollout.stages %}
+            <tr>
+              <td>{{ stage.stage }}</td>
+              <td class="small">{{ stage.label }}{% if stage.events %}<div class="hint">{% for e in stage.events %}{{ e.text }}{% if not loop.last %} · {% endif %}{% endfor %}</div>{% endif %}</td>
+              <td class="small">
+                {% if stage.checks %}
+                  {% for c in stage.checks %}<div>{{ c.writer_version_label }} 写 × {{ c.reader_version_label }} 读</div>{% endfor %}
+                {% else %}—{% endif %}
+              </td>
+              <td>
+                {% if stage.status == 'safe' %}<span class="tag ok">{{ stage.status_label }}</span>
+                {% elif stage.status in ('blocked', 'needs_confirm', 'unreachable') %}<span class="tag err">{{ stage.status_label }}</span>
+                {% else %}<span class="tag">{{ stage.status_label }}</span>{% endif %}
+              </td>
+              <td class="small">
+                {% if stage.checked and stage.checks %}
+                  {% for c in stage.checks %}<div>{{ c.label }} → {{ c.verdict_label }}{% if c.reasons %}<span class="hint">（{{ c.reasons[0] }}）</span>{% endif %}</div>{% endfor %}
+                {% else %}{{ stage.note }}{% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <div class="empty" style="padding:14px">未提供任务清单，无法计算滚动切换窗口。</div>
+      {% endif %}
+      <div class="panel-body tight">
         <details class="help" style="margin-top:8px">
           <summary>预演迁移 SQL（样例 {{ selected }}，执行后可在结果页下载）</summary>
           <pre class="sql" id="preview-sql">{{ preview.migration.sql_text }}</pre>

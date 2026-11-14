@@ -44,12 +44,13 @@
         <thead>
           <tr><th style="width:236px">运行 / 时间 / 来源</th><th style="width:104px">表</th>
             <th style="width:88px">兼容级别</th><th style="width:86px">ALTER / 回填</th>
-            <th style="width:66px">破损引用</th><th style="width:58px">可执行</th><th style="width:80px">操作</th></tr>
+            <th style="width:66px">破损引用</th><th style="width:150px">滚动切换（阶段 / 步骤）</th><th style="width:58px">可执行</th><th style="width:80px">操作</th></tr>
         </thead>
         <tbody>
         {% for r in runs %}
+          {% set ro_status = r.summary.rollout_status or 'unplanned' %}
           <tr data-level="{{ r.summary.level }}"
-              data-search="{{ r.run_id }} {{ r.table }} {{ r.source }} {{ r.summary.level }}">
+              data-search="{{ r.run_id }} {{ r.table }} {{ r.source }} {{ r.summary.level }} {{ r.summary.rollout_status_label or '' }}">
             <td>
               <a class="mono nowrap" href="/result/{{ r.run_id }}">{{ r.run_id }}</a>
               <div class="small muted">{{ r.created_at }} · {{ r.source }}</div>
@@ -63,6 +64,16 @@
             </td>
             <td class="num nowrap">{{ r.summary.sql_steps }} / {{ r.summary.backfill_count }}</td>
             <td class="num">{{ r.summary.broken_consumers }}</td>
+            <td class="small nowrap">
+              <span class="tag {% if ro_status == 'completed' %}ok{% elif ro_status in ('blocked', 'needs_confirm') %}err{% elif ro_status == 'in_progress' %}warn{% endif %}">{{ r.summary.rollout_status_label or '无切换计划' }}</span>
+              {% if ro_status != 'unplanned' %}
+              <div class="hint">
+                阶段 {{ r.summary.rollout_current_stage if r.summary.rollout_current_stage is not none else '—' }}/{{ r.summary.rollout_total_stages }}
+                · 已完成 {{ r.summary.rollout_completed }}
+                {% if r.summary.rollout_blocked_stage %}· 阻断于阶段 {{ r.summary.rollout_blocked_stage }}（{{ r.summary.rollout_blocking_combos }} 组合）{% endif %}
+              </div>
+              {% endif %}
+            </td>
             <td>{{ '是' if r.summary.can_execute else '否' }}</td>
             <td class="nowrap">
               <a href="/result/{{ r.run_id }}">查看</a> · <a href="/api/runs/{{ r.run_id }}/migration.sql">SQL</a>
@@ -155,11 +166,22 @@
             <div class="k-value">{{ latest.summary.blocking_count }}</div>
             <div class="k-note">破损引用 {{ latest.summary.broken_consumers }} · 需改名 {{ latest.summary.needs_update }}</div>
           </div>
+          <div class="kpi {% if latest.summary.rollout_status == 'completed' %}ok{% elif latest.summary.rollout_status in ('blocked', 'needs_confirm') %}err{% else %}warn{% endif %}">
+            <div class="k-label">滚动切换</div>
+            <div class="k-value" style="font-size:15px">{{ latest.summary.rollout_status_label or '无计划' }}</div>
+            <div class="k-note">阶段 {{ latest.summary.rollout_current_stage if latest.summary.rollout_current_stage is not none else '—' }}/{{ latest.summary.rollout_total_stages }} · 已完成 {{ latest.summary.rollout_completed }}</div>
+          </div>
         </div>
         <ul class="list small" style="margin:0">
           <li>字段匹配 {{ latest.match.rows|length }} 条 · 改名 {{ latest.summary.renamed }} · 新增 {{ latest.summary.added }} · 删除 {{ latest.summary.removed }}</li>
           <li>类型变更 {{ latest.type_changes|length }} 条 · 本次用到矩阵条目 {{ latest.matrix_usage|length }} 条</li>
           <li>能否执行迁移：{{ '是' if latest.summary.can_execute else '否（有阻断）' }} · 数据文件 {{ latest.consumers_check.files }} 个 / 引用 {{ latest.consumers_check.total_refs }} 处</li>
+          {% if latest.rollout and latest.rollout.available %}
+          <li>滚动窗口：{{ latest.rollout.window_text }}
+            · 当前阶段 {{ latest.rollout.execution.current_stage if latest.rollout.execution.current_stage is not none else '—' }}
+            · 已完成步骤 {% if latest.rollout.execution.completed_stages %}{{ latest.rollout.execution.completed_stages|join('、') }}{% else %}无{% endif %}
+            {% if latest.rollout.blocking_combos %}· 阻断组合 {% for c in latest.rollout.blocking_combos %}{{ '阶段 ' ~ c.stage ~ ' · ' ~ c.label }}{% if not loop.last %}；{% endif %}{% endfor %}{% endif %}</li>
+          {% endif %}
         </ul>
       </div>
       <div class="panel-actions">

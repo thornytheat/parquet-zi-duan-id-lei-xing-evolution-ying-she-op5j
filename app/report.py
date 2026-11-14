@@ -8,6 +8,7 @@ from .compat import judge
 from .consumers import check_consumers
 from .matching import BASIS_LABELS, KIND_LABELS, match_fields
 from .migration import ACTION_LABELS, plan
+from .rollout import build_plan, execution_summary, initial_execution  # noqa: F401
 from .types import VERDICT_LABELS
 
 
@@ -33,13 +34,16 @@ def _matrix_usage(pairs: list[dict]) -> list[dict]:
     return rows
 
 
-def build_run(old: dict, new: dict, consumers: dict, source: str = "自定义输入") -> dict:
+def build_run(old: dict, new: dict, consumers: dict, source: str = "自定义输入",
+              tasks: list[dict] | None = None) -> dict:
     """核心编排：纯计算，不读写文件。"""
     match = match_fields(old["fields"], new["fields"])
     pairs = match["pairs"]
     compat = judge(pairs, old.get("partitions"), new.get("partitions"))
     migration = plan(new["table"], pairs, compat)
     consumer_check = check_consumers(consumers["files"], pairs)
+    rollout = build_plan(list(tasks or []), compat)
+    rollout["execution"] = initial_execution(rollout)
 
     match_rows = []
     for index, p in enumerate(pairs, start=1):
@@ -99,6 +103,7 @@ def build_run(old: dict, new: dict, consumers: dict, source: str = "自定义输
         "old_schema": old,
         "new_schema": new,
         "consumers": consumers,
+        "tasks": list(tasks or []),
         "match": {
             "counts": match["counts"],
             "rows": match_rows,
@@ -117,6 +122,7 @@ def build_run(old: dict, new: dict, consumers: dict, source: str = "自定义输
         },
         "consumers_check": consumer_check,
         "block_reasons": block_reasons,
+        "rollout": rollout,
         "summary": {
             "level": compat["level"],
             "level_label": compat["level_label"],
@@ -135,11 +141,28 @@ def build_run(old: dict, new: dict, consumers: dict, source: str = "自定义输
             "can_execute": migration["can_execute"],
         },
     }
+    run["summary"].update(execution_summary(rollout))
+    return run
+
+
+def readiness(run: dict) -> dict:
+    """给历史里旧版本运行记录补默认字段，保证页面/下载读到同一结构。"""
+    run = dict(run)
+    rollout = run.get("rollout")
+    if not isinstance(rollout, dict):
+        rollout = build_plan([], run.get("compat") or {})
+    if not isinstance(rollout.get("execution"), dict):
+        rollout["execution"] = initial_execution(rollout)
+    run["rollout"] = rollout
+    run["summary"] = dict(run.get("summary") or {})
+    run["summary"].update(execution_summary(rollout))
     return run
 
 
 def overview(run: dict) -> dict:
     s = run["summary"]
+    rollout = run.get("rollout") or {}
+    execution = rollout.get("execution") or {}
     return {
         "run_id": run["run_id"],
         "table": run["table"],
@@ -153,7 +176,44 @@ def overview(run: dict) -> dict:
         "broken_consumers": s["broken_consumers"],
         "can_execute": s["can_execute"],
         "changed_fields": s["renamed"] + s["added"] + s["removed"] + s["id_changed"] + s["type_changed"],
+        "rollout_status": execution.get("status", "unplanned"),
+        "rollout_status_label": execution.get("status_label", "无切换计划"),
+        "rollout_current_stage": execution.get("current_stage"),
+        "rollout_total_stages": rollout.get("total_stages", 0),
+        "rollout_completed_stages": list(execution.get("completed_stages") or []),
+        "rollout_blocked_stage": rollout.get("first_stop_stage"),
+        "rollout_blocking_combos": rollout.get("blocking_combos") or [],
     }
+
+
+def rollout_text(run: dict) -> str:
+    """下载脚本附带的滚动切换进度：与页面/历史使用同一份阶段状态。"""
+    rollout = run.get("rollout") or {}
+    execution = rollout.get("execution") or {}
+    lines = ["-- 滚动切换计划（与页面同一状态）"]
+    lines.append(f"-- 计划状态：{rollout.get('status_label', '未提供任务清单')}")
+    if not rollout.get("available"):
+        lines.append("-- 未提供任务清单，未计算安全窗口")
+        return "\n".join(lines) + "\n"
+    current = execution.get("current_stage")
+    completed = execution.get("completed_stages") or []
+    completed_text = "、".join(str(item) for item in completed) if completed else "无"
+    lines.append(f"-- 执行状态：{execution.get('status_label', '待执行')} · "
+                 f"已完成步骤 {completed_text} · "
+                 f"当前阶段 {current if current is not None else '无'}")
+    lines.append(f"-- 窗口结论：{rollout.get('window_text', '')}")
+    for stage in rollout.get("stages", []):
+        mark = "已完成" if stage["stage"] in completed else stage["status_label"]
+        lines.append(f"-- 阶段 {stage['stage']}/{rollout.get('total_stages')} · {stage['label']} · {mark}")
+        for combo in stage["checks"]:
+            lines.append(f"--   核对 {combo['label']} → {combo['verdict_label']}")
+        if not stage["checks"]:
+            lines.append(f"--   {stage['note']}")
+    if rollout.get("blocking_combos"):
+        lines.append("-- 阻断组合：")
+        for combo in rollout["blocking_combos"]:
+            lines.append(f"--   阶段 {combo['stage']} · {combo['label']} · {combo['reason']}")
+    return "\n".join(lines) + "\n"
 
 
 def sql_download_name(run: dict) -> str:

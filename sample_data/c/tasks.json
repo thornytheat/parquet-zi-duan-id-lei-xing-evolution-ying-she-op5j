@@ -1,0 +1,8 @@
+{
+  "table": "dwd_shipment",
+  "tasks": [
+    {"name": "reader_ops_board", "role": "reader", "version": "old", "switch_at": "2026-11-20T01:30:00+00:00"},
+    {"name": "writer_shipment_daily", "role": "writer", "version": "old", "switch_at": "2026-11-20T02:00:00+00:00"},
+    {"name": "reader_archive", "role": "reader", "version": "old", "switch_at": "2026-11-20T03:00:00+00:00"}
+  ]
+}

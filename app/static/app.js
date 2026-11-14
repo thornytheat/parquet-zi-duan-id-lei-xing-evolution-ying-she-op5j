@@ -48,6 +48,7 @@
     var oldEl = qs('#old-schema');
     var newEl = qs('#new-schema');
     var consEl = qs('#consumers');
+    var tasksEl = qs('#tasks');
     var errBox = qs('#error-box');
     var okBox = qs('#ok-box');
     var sampleSel = qs('#sample-select');
@@ -67,6 +68,7 @@
           oldEl.value = data.old;
           newEl.value = data.new;
           consEl.value = data.consumers;
+          if (tasksEl) tasksEl.value = data.tasks || '';
           if (sampleHint) sampleHint.textContent = data.description + '（预期：' + data.expected + '）';
           if (okBox) {
             okBox.hidden = false;
@@ -86,13 +88,18 @@
         var payload = {
           old: oldEl ? oldEl.value : '',
           new: newEl ? newEl.value : '',
-          consumers: consEl ? consEl.value : ''
+          consumers: consEl ? consEl.value : '',
+          tasks: tasksEl ? tasksEl.value : ''
         };
         var data = await window.postJSON('/api/compare', payload);
         if (okBox) {
           okBox.hidden = false;
+          var rolloutNote = data.rollout && data.rollout.available
+            ? '，滚动切换 ' + (data.rollout.status_label || '')
+            : '';
           okBox.textContent = '对比完成：' + data.summary.level_label + '，ALTER ' +
-            data.summary.sql_steps + ' 条，broken_consumers ' + data.summary.broken_consumers + ' 处。正在跳转结果页…';
+            data.summary.sql_steps + ' 条，broken_consumers ' + data.summary.broken_consumers +
+            ' 处' + rolloutNote + '。正在跳转结果页…';
         }
         window.location.href = data.redirect;
       } catch (err) {
@@ -162,4 +169,33 @@
     });
     sqlBlock.parentNode.insertBefore(copyBtn, sqlBlock.nextSibling);
   }
+
+  // ---- 6) 结果页：推进/重试滚动切换阶段（同一 run 的阶段状态落在后端）----
+  qsa('[data-rollout-advance]').forEach(function (btn) {
+    btn.addEventListener('click', async function () {
+      var runId = btn.getAttribute('data-run-id');
+      var stage = parseInt(btn.getAttribute('data-rollout-advance'), 10);
+      var msg = qs('#rollout-msg');
+      btn.disabled = true;
+      var original = btn.textContent;
+      btn.textContent = '执行中…';
+      try {
+        var res = await fetch('/api/runs/' + runId + '/rollout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ stage: stage })
+        });
+        var data = await res.json();
+        if (msg) msg.textContent = data.message || data.detail || ('HTTP ' + res.status);
+        if (res.ok) {
+          window.location.reload();
+        }
+      } catch (err) {
+        if (msg) msg.textContent = '执行失败：' + (err && err.message ? err.message : String(err));
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    });
+  });
 })();
